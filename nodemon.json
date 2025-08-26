@@ -5,7 +5,7 @@
   ],
   "ext": "ts, html, json",
   "ignore": ["dist"],
-  "exec": "npm run build && npm run deploy && npm run restart",
+  "exec": "npm run build && npm run push && npm run restart",
   "signal": "SIGTERM",
   "env": {
     "NODE_OPTIONS": "--trace-warnings"

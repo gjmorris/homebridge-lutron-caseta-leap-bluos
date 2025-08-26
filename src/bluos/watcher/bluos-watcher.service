@@ -1,0 +1,21 @@
+[Unit]
+Description=BluOS Living/Kitchen Sync Watcher
+After=network.target
+Wants=network.target
+StartLimitIntervalSec=0
+StartLimitBurst=0
+
+[Service]
+Type=simple
+User=homebridge
+Group=homebridge
+ExecStart=/opt/homebridge/bin/node %p/dist/bluos/watcher/watcher.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bluos-watcher
+WorkingDirectory=%p
+
+[Install]
+WantedBy=multi-user.target

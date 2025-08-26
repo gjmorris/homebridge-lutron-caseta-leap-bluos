@@ -3,14 +3,24 @@ import type { ButtonDefinition, OneButtonStatusEvent, Response, SmartBridge } fr
 
 import type { DeviceWireResult, GlobalOptions, LutronCasetaLeap } from './platform.js'
 
-import { BluosController, playerMap, players, virtualPlayers } from './bluos/index.js'
+import { BluosController, masterPlayer, playerMap, players } from './bluos/index.js'
 import { PicoRemote } from './PicoRemote.js'
 
+/**
+ * Audio Pico remote implementation
+ *
+ * This class extends PicoRemote to add audio control functionality for physical
+ * Pico remotes with audio markings (play/pause, volume, preset, skip buttons).
+ *
+ * The current implementation is BluOS-specific, but the physical remote hardware
+ * is vendor-agnostic and could support other audio systems in the future.
+ *
+ */
 export class AudioPicoRemote extends PicoRemote {
   private bluosController: BluosController
   private volumeIntervals: Map<string, ReturnType<typeof setTimeout>> = new Map() // Store intervals for volume buttons
   private readonly VOLUME_REPEAT_INTERVAL = 300 // ms between volume adjustments when button is held
-  private commandsForButtons: Map<string, { command: string, modifier: string, player: string }> = new Map() // Track commands for buttons
+  private commandsForButtons: Map<string, { player: string }> = new Map() // Track volume buttons for cleanup
 
   constructor(
     platform: LutronCasetaLeap,
@@ -19,7 +29,7 @@ export class AudioPicoRemote extends PicoRemote {
     options: GlobalOptions,
   ) {
     super(platform, accessory, bridge, options)
-    this.bluosController = new BluosController(players, virtualPlayers)
+    this.bluosController = new BluosController(players, masterPlayer)
   }
 
   protected async setupButton(
@@ -41,65 +51,96 @@ export class AudioPicoRemote extends PicoRemote {
 
     const BUTTON_CONFIG = [
       {}, // index 0 unused
-      { command: 'start' },
-      { command: 'volume', single: { modifier: 'up' }, double: { modifier: 'up', modifier2: 'double' } },
-      { command: 'preset', single: { modifier: 'next' }, double: { modifier: 'previous' } },
-      { command: 'volume', single: { modifier: 'down' }, double: { modifier: 'down', modifier2: 'double' } },
-      { command: 'stop' },
+      {
+        name: 'play/pause | group',
+        singlePress: () => this.bluosController.playPause(players[player]),
+        doublePress: null,
+        longPress: () => this.bluosController.groupWithMaster(players[player]),
+      },
+      {
+        name: 'volume up',
+        singlePress: () => this.bluosController.volumeUp(players[player]),
+        doublePress: () => this.bluosController.volumeUp(players[player], true),
+        longPress: null,
+      },
+      {
+        name: 'preset',
+        singlePress: () => this.bluosController.presetNext(players[player]),
+        doublePress: () => this.bluosController.presetPrevious(players[player]),
+        longPress: null,
+      },
+      {
+        name: 'volume down',
+        singlePress: () => this.bluosController.volumeDown(players[player]),
+        doublePress: () => this.bluosController.volumeDown(players[player], true),
+        longPress: null,
+      },
+      {
+        name: 'skip | ungroup',
+        singlePress: () => this.bluosController.skipNext(players[player]),
+        doublePress: () => this.bluosController.skipPrevious(players[player]),
+        longPress: () => this.bluosController.ungroupFromMaster(players[player]),
+      },
     ]
     const buttonConfig = BUTTON_CONFIG[alias.index] ?? {}
-    const command = buttonConfig.command ?? ''
 
-    // Store command info for this button for use in handleEvent
-    if (command === 'volume' && buttonConfig.single?.modifier) {
-      this.commandsForButtons.set(button.href, {
-        command,
-        modifier: buttonConfig.single.modifier,
-        player,
-      })
+    // Store volume button info for continuous adjustment cleanup
+    if (alias.index === 2 || alias.index === 4) {
+      // Volume buttons
+      this.commandsForButtons.set(button.href, { player })
     }
 
-    const sendPlayerCommand = async (modifier: string, modifier2: string) => {
-      this.platform.log.info(
-        `Sending player command: ${player} ${command} ${modifier} ${modifier2}`,
-      )
+    const sendPlayerCommand = async (action: (() => Promise<void>) | null) => {
+      if (!action) {
+        return null
+      }
+
+      const buttonName = buttonConfig.name || 'unknown'
+
+      // Dynamically determine the action type by checking which property matches
+      let actionType = 'unknown'
+      if (action === buttonConfig.singlePress) {
+        actionType = 'single press'
+      } else if (action === buttonConfig.doublePress) {
+        actionType = 'double press'
+      } else if (action === buttonConfig.longPress) {
+        actionType = 'long press'
+      }
+
+      this.platform.log.info(`Sending command '${buttonName}' (${actionType}) for player '${player}'`)
       try {
-        await this.bluosController.controlPlayer(player, command, modifier, modifier2)
+        await action()
       } catch (error) {
-        this.platform.log.error('Error sending player command:', error)
+        this.platform.log.error(`Error sending command '${buttonName}' (${actionType}) for player '${player}'`, error)
       }
       return null
     }
 
-    const SINGLE_PRESS = () => {
-      const modifier = buttonConfig.single?.modifier ?? ''
-      return sendPlayerCommand(modifier, '')
-    }
-
-    const DOUBLE_PRESS = () => {
-      const modifier = buttonConfig.double?.modifier ?? ''
-      const modifier2 = buttonConfig.double?.modifier2 ?? ''
-      return sendPlayerCommand(modifier, modifier2)
-    }
+    const SINGLE_PRESS = () => sendPlayerCommand(buttonConfig.singlePress ?? null)
+    const DOUBLE_PRESS = () => sendPlayerCommand(buttonConfig.doublePress ?? null)
 
     // Handle long press for volume buttons
     const LONG_PRESS = () => {
       // If this is a volume button (up or down), start sending volume commands at intervals
-      if (command === 'volume' && buttonConfig.single?.modifier) {
-        const modifier = buttonConfig.single.modifier
-        this.startContinuousVolumeAdjustment(button.href, player, modifier, sendPlayerCommand)
-        this.platform.log.info(`Long press detected on ${alias.label} button - continuous volume ${modifier}`)
+      if (alias.index === 2 || alias.index === 4) {
+        // Volume buttons
+        const isUp = alias.index === 2
+        const volumeAction = isUp
+          ? () => this.bluosController.volumeUp(players[player])
+          : () => this.bluosController.volumeDown(players[player])
+        this.startContinuousVolumeAdjustment(button.href, player, isUp ? 'up' : 'down', volumeAction)
+        this.platform.log.info(`Long press detected on ${alias.label} button - starting continuous volume ${isUp ? 'up' : 'down'} for player ${player}`)
+      } else {
+        sendPlayerCommand(buttonConfig.longPress ?? null)
       }
-
-      return null
     }
 
     // Use helper method to set up button tracker and service
     // Only allow DOUBLE_PRESS for buttons that have double modifier configured
-    const hasDoublePress = buttonConfig.double !== undefined
+    const hasDoublePress = buttonConfig.doublePress !== undefined
 
     // If no single/double modifiers in BUTTON_CONFIG, only allow SINGLE_PRESS
-    if (!buttonConfig.single && !buttonConfig.double) {
+    if (!buttonConfig.singlePress && !buttonConfig.doublePress) {
       // Update validValues to only include SINGLE_PRESS
       validValues = [this.platform.api.hap.Characteristic.ProgrammableSwitchEvent.SINGLE_PRESS]
 
@@ -131,17 +172,13 @@ export class AudioPicoRemote extends PicoRemote {
     const buttonHref = evt.Button.href
     const eventType = evt.ButtonEvent.EventType
 
-    // If this is a volume button and we have command info for it
-    if (this.commandsForButtons.has(buttonHref)) {
+    // If this is a volume button, stop continuous volume on release
+    if (this.commandsForButtons.has(buttonHref) && eventType === 'Release') {
       const buttonInfo = this.commandsForButtons.get(buttonHref)!
-
-      // For release events, stop continuous volume if it's running
-      if (eventType === 'Release') {
-        if (this.volumeIntervals.has(buttonHref)) {
-          clearInterval(this.volumeIntervals.get(buttonHref)!)
-          this.volumeIntervals.delete(buttonHref)
-          this.platform.log.info(`Button released - stopped continuous volume for player ${buttonInfo.player}`)
-        }
+      if (this.volumeIntervals.has(buttonHref)) {
+        clearInterval(this.volumeIntervals.get(buttonHref)!)
+        this.volumeIntervals.delete(buttonHref)
+        this.platform.log.info(`Button released - stopped continuous volume for player ${buttonInfo.player}`)
       }
     }
   }
@@ -153,7 +190,7 @@ export class AudioPicoRemote extends PicoRemote {
     buttonHref: string,
     player: string,
     modifier: string,
-    sendCommandFn?: (modifier: string, modifier2: string) => Promise<any>,
+    volumeAction: () => Promise<void>,
   ): void {
     // Clear any existing interval for this button
     if (this.volumeIntervals.has(buttonHref)) {
@@ -161,29 +198,19 @@ export class AudioPicoRemote extends PicoRemote {
       this.volumeIntervals.delete(buttonHref)
     }
 
-    // Function to send volume command - either use provided function or send directly
-    const sendCommand = sendCommandFn
-      || (async (mod: string, mod2: string) => {
-        try {
-          await this.bluosController.controlPlayer(player, 'volume', mod, mod2)
-        } catch (error) {
-          this.platform.log.error('Error sending player command:', error)
-        }
-      })
-
     // Set up recurring volume adjustments
     const interval = setInterval(() => {
       this.platform.log.debug(
         `Continuous volume ${modifier} for ${player}`,
       )
-      sendCommand(modifier, '')
+      volumeAction()
     }, this.VOLUME_REPEAT_INTERVAL)
 
     // Store the interval reference to clear it later
     this.volumeIntervals.set(buttonHref, interval)
 
     // Send initial command immediately
-    sendCommand(modifier, '')
+    volumeAction()
 
     this.platform.log.info(`Started continuous volume ${modifier} for player ${player}`)
   }

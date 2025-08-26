@@ -61,11 +61,51 @@ This plugin supports using Pico remotes to control BluOS audio players. The BluO
 Setup is required to configure the plugin to work with your environment:
 
 Copy `src/bluos/config.ts.sample` to `src/bluos/config.ts` and edit:
-- Configure IP addresses and ports for  BluOS players
+
+- Configure IP addresses and ports for BluOS players
 - Set up virtual player groups if desired
 - Map Pico remote serial numbers to player names (these remotes will automatically be treated as audio remotes)
 
 (Find device serial numbers in the Homebridge UI under Accessories > device_name > Accessory Information > Serial Number)
+
+#### CLI Usage
+
+This plugin includes a command-line interface for controlling BluOS players directly. After building the project, you can use the CLI as follows:
+
+```bash
+# Check player status
+./dist/bluos/cli.js living status
+
+# Toggle play/pause
+./dist/bluos/cli.js kitchen playpause
+
+# Navigate presets
+./dist/bluos/cli.js living preset next
+./dist/bluos/cli.js living preset previous
+
+# Skip tracks
+./dist/bluos/cli.js kitchen skip next
+./dist/bluos/cli.js kitchen skip previous
+
+# Control volume
+./dist/bluos/cli.js garage volume up
+./dist/bluos/cli.js garage volume down
+
+# Get help
+./dist/bluos/cli.js
+```
+
+**Available Commands:**
+
+- `playpause` - Toggle play/pause for the specified player
+- `status` - Get current status of the specified player (returns exit code 0 if playing, 1 if not)
+- `preset <next|previous>` - Navigate to next/previous preset
+- `skip <next|previous>` - Skip to next/previous track
+- `volume <up|down>` - Increase/decrease volume
+
+**Available Players:** The CLI will show all configured players from your `src/bluos/config.ts` file.
+
+You can also install the CLI globally by running `npm link` in the project directory, which will make the `bluos` command available system-wide.
 
 #### Exclude Picos...
 
@@ -175,8 +215,13 @@ I welcome contributions! I wrote this to scratch an itch (no Serena wood blind s
 - Make changes in this repo
 - `rm ~/.homebridge/accessories/cachedAccessories; DEBUG='leap:*,HAP-NodeJS:Accessory' npm run watch`
 - `npm run lint`
-- If pushing to a remote server, create .env file from .env.template and specify ssh connection and remote homebridge user
-- `npm run deploy`
+- If pushing to a remote server:
+  - Create .env file from .env.template and specify ssh connection and remote homebridge user
+  - Add sudo entries for the restart scripts:
+    - <YOUR_SSH_USER> ALL=(homebridge) NOPASSWD: /usr/bin/kill -SIGTERM *
+    - <YOUR_SSH_USER> ALL=(root) NOPASSWD: /usr/bin/systemctl restart bluos-watcher.service
+  - `npm run deploy`
+
 
 ## 💨 Legacy Configuration
 

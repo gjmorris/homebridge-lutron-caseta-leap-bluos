@@ -7,254 +7,186 @@ export interface PlayerConfig {
   preset: number
 }
 
-export interface VirtualPlayerConfig {
-  name: string
-  primary: PlayerConfig
-  slaves: PlayerConfig[]
-}
-
 export interface Players {
   [key: string]: PlayerConfig
 }
 
-export interface VirtualPlayers {
-  [key: string]: VirtualPlayerConfig
+export interface PlayerStatus {
+  isTv: boolean
+  state: string
+  volume: number
+  slaves?: Array<{ id: string; port: string }>
+  etag?: string
 }
 
+/**
+ * Implements the BluOS API for controlling players.
+ *
+ * The BluOS API v1.7 is documented here:
+ * https://bluos.io/wp-content/uploads/2025/06/BluOS-Custom-Integration-API_v1.7.pdf
+ */
 export class BluosController {
   private players: Players
-  private virtualPlayers: VirtualPlayers
+  private masterPlayer: PlayerConfig
+  private statusCache = new Map<PlayerConfig, PlayerStatus>()
 
-  constructor(players: Players, virtualPlayers: VirtualPlayers) {
+  constructor(players: Players, masterPlayer: PlayerConfig) {
     this.players = players
-    this.virtualPlayers = virtualPlayers
+    this.masterPlayer = masterPlayer
   }
 
-  private async makeRequest(url: string): Promise<string> {
+  /**
+   * Make a single HTTP request to a BluOS player
+   */
+  private async apiRequest(player: PlayerConfig, path: string, timeoutMs: number = 5000, quiet: boolean = false): Promise<string> {
+    const url = `http://${player.ip}:${player.port}${path}`
     try {
-      await axios.get(url, { timeout: 5000 })
-      return 'success'
+      const response = await axios.get(url, { timeout: timeoutMs })
+      return response.data
     } catch (error) {
-      console.error(`Error making request to ${url}:`, error)
-      return 'error'
-    }
-  }
-
-  private async getPlayerStatus(
-    player: PlayerConfig,
-  ): Promise<{ isPlaying: boolean, isTv: boolean }> {
-    try {
-      const response = await axios.get(
-        `http://${player.ip}:${player.port}/Status`,
-        { timeout: 5000 },
-      )
-      const status = response.data
-      const isPlaying = /<state>(?:stream|play)<\/state>/.test(status)
-      const isTv = /<title1>TV<\/title1>/.test(status)
-      return { isPlaying, isTv }
-    } catch (error) {
-      console.error('Error getting player status:', error)
-      return { isPlaying: false, isTv: false }
-    }
-  }
-
-  private async ungroupPlayers(
-    primaryPlayer: PlayerConfig,
-    slaves: PlayerConfig[],
-  ): Promise<void> {
-    const otherPlayers = Object.values(this.players).filter(
-      player =>
-        player.ip !== primaryPlayer.ip
-        || (player.port !== primaryPlayer.port
-          && !slaves.some(
-            slave => slave.ip === player.ip && slave.port === player.port,
-          )),
-    )
-
-    const slavesString = otherPlayers.map(p => p.ip).join(',')
-    const portsString = otherPlayers.map(p => p.port).join(',')
-
-    // Ungroup primary and all slaves from other players
-    const allPlayersToUngroup = [primaryPlayer, ...slaves]
-    await Promise.all(
-      allPlayersToUngroup.map(player =>
-        this.makeRequest(
-          `http://${player.ip}:${player.port}/RemoveSlave?slaves=${slavesString}&ports=${portsString}`,
-        ),
-      ),
-    )
-  }
-
-  private async controlVolume(
-    players: PlayerConfig[],
-    modifier: string,
-    modifier2?: string,
-  ): Promise<void> {
-    const delta = modifier2 === 'double' ? '4' : '2'
-    const sign = modifier === 'down' ? '-' : ''
-    await Promise.all(
-      players.map(player =>
-        this.makeRequest(
-          `http://${player.ip}:${player.port}/Volume?db=${sign}${delta}&tell_slaves=1`,
-        ),
-      ),
-    )
-  }
-
-  private async controlPreset(
-    players: PlayerConfig[],
-    modifier: string,
-  ): Promise<void> {
-    const sign = modifier === 'next' ? '+' : '-'
-    await Promise.all(
-      players.map(player =>
-        this.makeRequest(
-          `http://${player.ip}:${player.port}/Preset?id=${sign}1`,
-        ),
-      ),
-    )
-  }
-
-  private async controlSkip(players: PlayerConfig[]): Promise<void> {
-    await Promise.all(
-      players.map(player =>
-        this.makeRequest(`http://${player.ip}:${player.port}/Skip`),
-      ),
-    )
-  }
-
-  public async controlVirtualPlayer(
-    virtualPlayerName: string,
-    action: string,
-    modifier?: string,
-    modifier2?: string,
-  ): Promise<void> {
-    const virtualPlayer = this.virtualPlayers[virtualPlayerName]
-    if (!virtualPlayer) {
-      console.error(`Invalid virtual player name: ${virtualPlayerName}`)
-      return
-    }
-
-    const { primary, slaves } = virtualPlayer
-
-    if (action === 'start') {
-      const primaryStatus = await this.getPlayerStatus(primary)
-      const slaveStatuses = await Promise.all(
-        slaves.map(slave => this.getPlayerStatus(slave)),
-      )
-      const anyPlaying = slaveStatuses.some(status => status.isPlaying)
-
-      if ((!primaryStatus.isPlaying || primaryStatus.isTv) && !anyPlaying) {
-        // Stop any current playback and ungroup everything
-        await this.ungroupPlayers(primary, slaves)
-
-        // Group slaves with primary
-        await Promise.all(
-          slaves.map(slave =>
-            this.makeRequest(
-              `http://${primary.ip}:${primary.port}/AddSlave?slave=${slave.ip}&port=${slave.port}`,
-            ),
-          ),
-        )
-
-        // Set volumes
-        await Promise.all([
-          this.makeRequest(
-            `http://${primary.ip}:${primary.port}/Volume?level=${primary.volume}`,
-          ),
-          ...slaves.map(slave =>
-            this.makeRequest(
-              `http://${slave.ip}:${slave.port}/Volume?level=${slave.volume}`,
-            ),
-          ),
-        ])
-
-        // Start playback on primary
-        await this.makeRequest(
-          `http://${primary.ip}:${primary.port}/Preset?id=${primary.preset}`,
-        )
-      } else {
-        // Stop playback and ungroup
-        await this.makeRequest(`http://${primary.ip}:${primary.port}/Stop`)
-        await this.ungroupPlayers(primary, slaves)
+      if (!quiet) {
+        const errorMessage = error instanceof Error ? error.message : String(error)
+        console.error(`Error making request to ${url}: ${errorMessage}`)
       }
-    } else if (action === 'stop') {
-      await this.makeRequest(`http://${primary.ip}:${primary.port}/Stop`)
-      await this.ungroupPlayers(primary, slaves)
-    } else if (action === 'volume' && modifier) {
-      await this.controlVolume([primary], modifier, modifier2)
-    } else if (action === 'preset' && modifier) {
-      await this.controlPreset([primary], modifier)
-    } else if (action === 'skip') {
-      await this.controlSkip([primary])
+      throw error
     }
   }
 
-  public async controlPlayer(
-    playerName: string,
-    action: string,
-    modifier?: string,
-    modifier2?: string,
-  ): Promise<void> {
-    // Check if it's a virtual player first
-    if (this.virtualPlayers[playerName]) {
-      await this.controlVirtualPlayer(playerName, action, modifier, modifier2)
-      return
-    }
+  /**
+   * Play/pause toggle with special logic for TV source
+   */
+  public async playPause(player: PlayerConfig): Promise<void> {
+    const status = await this.getStatus(player)
 
-    // Otherwise treat as a regular player
-    const player = this.players[playerName]
-    if (!player) {
-      console.error(`Invalid player name: ${playerName}`)
-      return
-    }
-
-    if (action === 'start') {
-      const status = await this.getPlayerStatus(player)
-
-      if (!status.isPlaying || status.isTv) {
-        await this.makeRequest(
-          `http://${player.ip}:${player.port}/Volume?level=${player.volume}`,
-        )
-        await this.makeRequest(
-          `http://${player.ip}:${player.port}/Preset?id=${player.preset}`,
-        )
-      } else {
-        await this.makeRequest(`http://${player.ip}:${player.port}/Stop`)
-      }
-    } else if (action === 'stop') {
-      await this.makeRequest(`http://${player.ip}:${player.port}/Stop`)
-    } else if (action === 'volume' && modifier) {
-      await this.controlVolume([player], modifier, modifier2)
-    } else if (action === 'preset' && modifier) {
-      await this.controlPreset([player], modifier)
-    } else if (action === 'skip') {
-      await this.controlSkip([player])
+    if ((status.state === 'stream' || status.state === 'play') && !status.isTv) {
+      // If playing and not TV, pause
+      await this.apiRequest(player, '/Pause')
+    } else if (status.state === 'pause' && !status.isTv) {
+      // If paused and not TV, resume playback
+      await this.apiRequest(player, '/Play')
+    } else {
+      // If stopped, TV source, or any other state, start fresh with preset
+      await this.apiRequest(player, `/Volume?level=${player.volume}`)
+      await this.apiRequest(player, `/Preset?id=${player.preset}`)
     }
   }
 
-  public async getPlayerPlayingStatus(playerName: string): Promise<boolean> {
-    // For virtual players, check all constituent players
-    const virtualPlayer = this.virtualPlayers[playerName]
-    if (virtualPlayer) {
-      const primaryStatus = await this.getPlayerStatus(virtualPlayer.primary)
-      const slaveStatuses = await Promise.all(
-        virtualPlayer.slaves.map(slave => this.getPlayerStatus(slave)),
-      )
-      return (
-        (primaryStatus.isPlaying && !primaryStatus.isTv)
-        || slaveStatuses.some(status => status.isPlaying)
-      )
-    }
+  /**
+   * Stop playback. Generally not exposed via UI or buttons.
+   */
+  public async stop(player: PlayerConfig): Promise<void> {
+    await this.apiRequest(player, '/Stop')
+  }
 
-    // For regular players
-    const player = this.players[playerName]
-    if (!player) {
-      console.error(`Invalid player name: ${playerName}`)
-      return false
-    }
+  /**
+   * Volume control
+   */
+  public async volumeUp(player: PlayerConfig, double: boolean = false): Promise<void> {
+    const delta = double ? '4' : '2'
+    await this.apiRequest(player, `/Volume?db=${delta}`)
+  }
 
-    const status = await this.getPlayerStatus(player)
-    return status.isPlaying && !status.isTv
+  public async volumeDown(player: PlayerConfig, double: boolean = false): Promise<void> {
+    const delta = double ? '4' : '2'
+    await this.apiRequest(player, `/Volume?db=-${delta}`)
+  }
+
+  public async volumeLevel(player: PlayerConfig, level: number): Promise<void> {
+    await this.apiRequest(player, `/Volume?level=${level}`)
+  }
+
+  /**
+   * Preset navigation
+   */
+  public async presetNext(player: PlayerConfig): Promise<void> {
+    await this.apiRequest(player, '/Preset?id=+1')
+  }
+
+  public async presetPrevious(player: PlayerConfig): Promise<void> {
+    await this.apiRequest(player, '/Preset?id=-1')
+  }
+
+  /**
+   * Track navigation
+   */
+  public async skipNext(player: PlayerConfig): Promise<void> {
+    await this.apiRequest(player, '/Action?action=Next')
+  }
+
+  public async skipPrevious(player: PlayerConfig): Promise<void> {
+    await this.apiRequest(player, '/Action?action=Previous')
+  }
+
+  /**
+   * Group / Ungroup a player with the master player
+   */
+  public async groupWithMaster(player: PlayerConfig): Promise<void> {
+    await this.apiRequest(this.masterPlayer, `/AddSlave?slave=${player.ip}&port=${player.port}`)
+  }
+
+  public async ungroupFromMaster(player: PlayerConfig): Promise<void> {
+    await this.apiRequest(this.masterPlayer, `/RemoveSlave?slave=${player.ip}&port=${player.port}`)
+  }
+
+  /**
+   * Get the current status of a player, optionally using long polling
+   *
+   * @param player - The player to get the status of
+   * @param options - Optional parameters:
+   *   - longPoll: Whether to use long polling (default: false)
+   *   - longPollTimeoutSec: Timeout for long polling (default: 120 seconds)
+   */
+  public async getStatus(player: PlayerConfig, options?: { longPoll?: boolean; longPollTimeoutSec?: number }): Promise<PlayerStatus> {
+    const useLongPoll = options?.longPoll === true
+    const timeoutSec = options?.longPollTimeoutSec ?? 120
+
+    // If long polling is enabled, use the etag from the cache if it exists
+    const existingEtag = this.statusCache.get(player)?.etag
+    const statusPath = useLongPoll
+      ? `/Status?timeout=${timeoutSec}${existingEtag ? `&etag=${encodeURIComponent(existingEtag)}` : ''}`
+      : '/Status'
+
+    // Fetch the status XML and extract the etag
+    const statusXml = await this.apiRequest(player, statusPath, (useLongPoll ? (timeoutSec * 1000) : 5000), useLongPoll)
+    const etagMatch = statusXml.match(/etag="([^"]*)"/)
+    const etag = etagMatch?.[1]
+
+    // Need to fetch the full status if long polling is not enabled, or the etag has changed, or the status is not in the cache
+    if (!useLongPoll || (etag && etag !== existingEtag) || !this.statusCache.has(player)) {
+      // Extract state and isTV from the status XML
+      const stateMatch = statusXml.match(/<state>([^<]*)<\/state>/)
+      const state = stateMatch?.[1] ?? ''
+      const isTv = /<title1>TV<\/title1>/.test(statusXml) 
+  
+      // Fetch the sync status XML and extract the volume and slaves
+      const syncStatusXml = await this.apiRequest(player, '/SyncStatus')
+      const volumeMatch = syncStatusXml.match(/volume="([^"]*)"/)
+      const volume = volumeMatch ? Number.parseInt(volumeMatch[1]) : 0
+      const slavePlayers = syncStatusXml.match(/<slave[^>]*>.*?<\/slave>/g)
+      const slaves = slavePlayers?.map((slaveXml) => {
+        const idMatch = slaveXml.match(/id="([^"]*)"/)
+        const portMatch = slaveXml.match(/port="([^"]*)"/)
+        return {
+          id: idMatch?.[1] ?? '',
+          port: portMatch?.[1] ?? '',
+        }
+      }).filter(slave => slave.id !== '') ?? []
+      
+      // Cache the status and return it
+      const currentStatus: PlayerStatus = { isTv, state, volume, slaves, etag }
+      this.statusCache.set(player, currentStatus)
+      return currentStatus
+    } else {
+      // Return last known state when no change
+      return this.statusCache.get(player) ?? { isTv: false, state: '', volume: 0, slaves: [] }
+    }
+  }
+
+  /**
+   * Check if a player is currently playing
+   */
+  public async isPlaying(player: PlayerConfig): Promise<boolean> {
+    const status = await this.getStatus(player)
+    return (status.state === 'stream' || status.state === 'play')
   }
 }
